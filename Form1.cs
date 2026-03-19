@@ -52,7 +52,24 @@ namespace DiscordAutoChat
                 AppendLog("連接中...");
                 await _ws.ConnectAsync(new Uri("wss://gateway.discord.gg/?v=9&encoding=json"), CancellationToken.None);
 
-                var auth = new { op = 2, d = new { token = token, properties = new { os = "Windows", browser = "Chrome", device = "" }, intents = 32767 } };
+                var auth = new
+                {
+                    op = 2,
+                    d = new
+                    {
+                        token = token,
+                        properties = new
+                        {
+                            os = "Windows",
+                            browser = "Chrome", // 偽裝成 Chrome
+                            device = "",
+                            system_locale = "zh-TW",
+                            browser_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            browser_version = "120.0.0.0"
+                        },
+                        intents = 32767
+                    }
+                };
                 await SendJsonAsync(JsonConvert.SerializeObject(auth));
 
                 _ = Task.Run(() => ReceiveLoop(token));
@@ -65,10 +82,11 @@ namespace DiscordAutoChat
             }
             catch (Exception ex) { AppendLog($"連線失敗: {ex.Message}"); }
         }
-
+        private DateTime _lastForwardTime = DateTime.MinValue;
         private async Task ReceiveLoop(string currentToken)
         {
-            var buffer = new byte[1024 * 64];
+
+            var buffer = new byte[1024 * 16]; // 16KB 緩衝區
             while (_ws.State == WebSocketState.Open)
             {
                 try
@@ -76,7 +94,7 @@ namespace DiscordAutoChat
                     WebSocketReceiveResult result;
                     var ms = new System.IO.MemoryStream();
 
-                    // 循環接收直到拿到完整的 EndOfMessage
+                    // 1. 確保完整接收大封包 (如 READY)
                     do
                     {
                         result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
@@ -86,13 +104,15 @@ namespace DiscordAutoChat
                     string rawJson = Encoding.UTF8.GetString(ms.ToArray());
                     var data = JObject.Parse(rawJson);
                     string t = data["t"]?.ToString();
-                    // 不分大小寫分析 READY 
+
+                    // 2. 登入成功事件 (獲取自己的 ID)
                     if (!string.IsNullOrEmpty(t) && t.Equals("READY", StringComparison.OrdinalIgnoreCase))
                     {
                         _myUserId = data["d"]["user"]["id"].ToString();
-                        AppendLog($"[系統] 識別成功！我的 ID 為: {_myUserId}");
+                        AppendLog($"[系統] 登入成功！您的 ID 是: {_myUserId}");
                     }
 
+                    // 3. 接收訊息事件
                     if (!string.IsNullOrEmpty(t) && t.Equals("MESSAGE_CREATE", StringComparison.OrdinalIgnoreCase))
                     {
                         var d = data["d"];
@@ -101,43 +121,66 @@ namespace DiscordAutoChat
                         string content = d["content"].ToString();
                         string channelId = d["channel_id"].ToString();
 
-                        // 判斷是否為私訊 (無 guild_id)
+                        // 判斷是否為私訊 (guild_id 為空)
                         if (d["guild_id"] == null)
                         {
                             string forwardText = "";
 
-                            // --- 關鍵判斷邏輯 ---
                             if (authorId == _myUserId)
                             {
-                                // 嘗試從緩存中找出這個 channelId 對應的使用者名稱
+                                // A. 如果是我發出的 (回覆別人)
+                                // 從字典反查這個頻道 ID 是屬於哪個使用者的
                                 string targetName = _userChannels.FirstOrDefault(x => x.Value == channelId).Key ?? "未知對象";
-
-                                // 格式化轉發文字
                                 forwardText = $"【回覆給 {targetName}】: {content}";
 
                                 this.Invoke((MethodInvoker)delegate {
-                                    // 在介面清單顯示回覆了誰
                                     lstMessages.Items.Add($"> [回覆 {targetName}]: {content}");
                                 });
                             }
                             else
                             {
-                                // 這是對方發來的訊息
+                                // B. 如果是對方發來的
                                 forwardText = $"【收到來自 {authorName}】: {content}";
+
                                 this.Invoke((MethodInvoker)delegate {
-                                    if (!_userChannels.ContainsKey(authorName)) _userChannels.Add(authorName, channelId);
+                                    // 自動記憶此對話，方便之後主動回覆
+                                    if (!_userChannels.ContainsKey(authorName)) _userChannels[authorName] = channelId;
                                     lstMessages.Items.Add($"[{authorName}]: {content}");
                                 });
                             }
 
-                            // 執行轉發到指定的頻道
+                            // 4. 執行安全轉發邏輯
                             string forwardId = txtForwardChannelId.Text.Trim();
                             if (!string.IsNullOrEmpty(forwardId))
+                            {
+                                // --- 防封鎖：強制延遲保護 ---
+                                double elapsed = (DateTime.Now - _lastForwardTime).TotalMilliseconds;
+                                int minDelay = random.Next(10000, 15000); // 隨機延遲 10 ~ 15 秒
+
+                                if (elapsed < minDelay)
+                                {
+                                    int waitTime = minDelay - (int)elapsed;
+                                    // AppendLog($"[安全] 轉發冷卻中，等待 {waitTime}ms...");
+                                    await Task.Delay(waitTime);
+                                }
+
+                                // 模擬打字效果 (更像真人)
+                                await SendTypingIndicator(forwardId, currentToken);
+                                await Task.Delay(random.Next(2000, 5000));
+
+                                // 正式轉發
                                 await SendDiscordMessage(forwardId, currentToken, forwardText);
+                                _lastForwardTime = DateTime.Now; // 更新最後轉發時間
+                            }
                         }
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // 避免因為單個封包解析失敗導致整個 Loop 停止
+                    if (_ws.State == WebSocketState.Open)
+                        AppendLog($"[監聽錯誤]: {ex.Message}");
+                }
             }
         }
 
@@ -165,32 +208,77 @@ namespace DiscordAutoChat
 
         private async Task RunChatTask(List<string> channels, List<string> tokens, string msg, CancellationToken ct)
         {
-            while (!ct.IsCancellationRequested)
+            try
             {
-                if (chkEnableTimeLimit.Checked)
-                {
-                    TimeSpan start = dtpStartTime.Value.TimeOfDay;
-                    TimeSpan end = dtpEndTime.Value.TimeOfDay;
-                    TimeSpan now = DateTime.Now.TimeOfDay;
-                    bool inRange = (start <= end) ? (now >= start && now <= end) : (now >= start || now <= end);
-                    if (!inRange) { await Task.Delay(30000, ct); continue; }
-                }
+                AppendLog("[系統] 自動發文任務已啟動。");
 
-                foreach (var auth in tokens)
+                while (!ct.IsCancellationRequested)
                 {
-                    foreach (var channelId in channels)
+                    // 檢查時段限制
+                    if (chkEnableTimeLimit.Checked)
                     {
-                        if (ct.IsCancellationRequested) return;
-                        await SendDiscordMessage(channelId, auth, msg);
-                        await Task.Delay(random.Next(2000, 5000), ct);
+                        TimeSpan start = dtpStartTime.Value.TimeOfDay;
+                        TimeSpan end = dtpEndTime.Value.TimeOfDay;
+                        TimeSpan now = DateTime.Now.TimeOfDay;
+                        bool inRange = (start <= end) ? (now >= start && now <= end) : (now >= start || now <= end);
+
+                        if (!inRange)
+                        {
+                            // 沒在時段內，等待 30 秒再檢查，傳入 ct 確保能隨時停止
+                            await Task.Delay(30000, ct);
+                            continue;
+                        }
                     }
+
+                    foreach (var auth in tokens)
+                    {
+                        foreach (var channelId in channels)
+                        {
+                            // 每次發送前都檢查一次是否已取消
+                            if (ct.IsCancellationRequested) break;
+
+                            await SendDiscordMessage(channelId, auth, msg);
+                            AppendLog($"[發送] 頻道: {channelId} 成功。");
+
+                            // 隨機延遲，傳入 ct 確保按下停止時能「立刻」中斷，而不是等完這幾秒
+                            int nextDelay = random.Next(2000, 5000);
+                            await Task.Delay(nextDelay, ct);
+                        }
+                        if (ct.IsCancellationRequested) break;
+                    }
+
+                    // 大循環延遲 (秒)
+                    int loopDelay = (int)numMinDelay.Value * 1000;
+                    await Task.Delay(loopDelay, ct);
                 }
-                await Task.Delay((int)numMinDelay.Value * 1000, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                // 這是正常停止，不需當作錯誤處理
+                AppendLog("[系統] 任務已手動停止。");
+            }
+            catch (Exception ex)
+            {
+                // 捕捉其他非預期的錯誤
+                AppendLog($"[異常] 任務中斷: {ex.Message}");
+            }
+            finally
+            {
+                // 確保按鈕狀態恢復
+                this.Invoke((MethodInvoker)delegate {
+                    btnStart.Enabled = true;
+                    btnStop.Enabled = false;
+                });
             }
         }
 
         private async Task SendDiscordMessage(string channelId, string auth, string text)
         {
+            // 1. 先模擬打字
+            await SendTypingIndicator(channelId, auth);
+            // 2. 模擬打字需要時間 (隨機 1.5 ~ 3 秒)
+            await Task.Delay(random.Next(5000, 10000));
+
             var url = $"https://discord.com/api/v9/channels/{channelId}/messages";
             var payload = new { content = text, tts = false };
             using (var request = new HttpRequestMessage(HttpMethod.Post, url))
@@ -217,7 +305,15 @@ namespace DiscordAutoChat
                 await _ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
-        private void btnStop_Click(object sender, EventArgs e) => _cts?.Cancel();
+        private void btnStop_Click(object sender, EventArgs e)
+        {
+            if (_cts != null)
+            {
+                AppendLog("[系統] 正在停止任務...");
+                _cts.Cancel();
+                // 這裡不需要 Dispose，讓 Task 內部的 finally 處理 UI 狀態
+            }
+        }
 
         private void lstMessages_SelectedIndexChanged(object sender, EventArgs e)
         {
@@ -317,7 +413,15 @@ namespace DiscordAutoChat
             AppendLog("[系統] 已清除所有畫面訊息。");
         }
 
-
+        private async Task SendTypingIndicator(string channelId, string token)
+        {
+            var url = $"https://discord.com/api/v9/channels/{channelId}/typing";
+            using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+            {
+                request.Headers.TryAddWithoutValidation("Authorization", token);
+                try { await client.SendAsync(request); } catch { }
+            }
+        }
         private void Form1_Load(object sender, EventArgs e)
         {
 

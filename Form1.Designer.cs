@@ -129,6 +129,7 @@
             // 
             numMinDelay.Location = new Point(125, 435);
             numMinDelay.Margin = new Padding(4, 5, 4, 5);
+            numMinDelay.Maximum = new decimal(new int[] { 3000, 0, 0, 0 });
             numMinDelay.Name = "numMinDelay";
             numMinDelay.Size = new Size(82, 27);
             numMinDelay.TabIndex = 7;
@@ -137,6 +138,7 @@
             // 
             numMaxDelay.Location = new Point(241, 435);
             numMaxDelay.Margin = new Padding(4, 5, 4, 5);
+            numMaxDelay.Maximum = new decimal(new int[] { 3000, 0, 0, 0 });
             numMaxDelay.Name = "numMaxDelay";
             numMaxDelay.Size = new Size(82, 27);
             numMaxDelay.TabIndex = 8;

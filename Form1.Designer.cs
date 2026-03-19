@@ -33,18 +33,19 @@
             txtReply = new TextBox();
             btnSendReply = new Button();
             lblReplyTarget = new Label();
-            txtForwardChannelId = new TextBox();
             label1 = new Label();
             label2 = new Label();
             label3 = new Label();
             label4 = new Label();
-            label5 = new Label();
             lblStatus = new Label();
             label7 = new Label();
             btnFetchDMs = new Button();
             lstDMs = new ListBox();
             btnClearLogs = new Button();
             label6 = new Label();
+            txtChatHistory = new TextBox();
+            txtForwardChannelId = new TextBox();
+            label5 = new Label();
             ((System.ComponentModel.ISupportInitialize)numMinDelay).BeginInit();
             ((System.ComponentModel.ISupportInitialize)numMaxDelay).BeginInit();
             SuspendLayout();
@@ -116,13 +117,13 @@
             // 
             txtLog.BackColor = Color.Black;
             txtLog.ForeColor = Color.Lime;
-            txtLog.Location = new Point(18, 633);
+            txtLog.Location = new Point(18, 641);
             txtLog.Margin = new Padding(4, 5, 4, 5);
             txtLog.Multiline = true;
             txtLog.Name = "txtLog";
             txtLog.ReadOnly = true;
             txtLog.ScrollBars = ScrollBars.Vertical;
-            txtLog.Size = new Size(1138, 216);
+            txtLog.Size = new Size(1350, 216);
             txtLog.TabIndex = 6;
             // 
             // numMinDelay
@@ -177,24 +178,24 @@
             // lstMessages
             // 
             lstMessages.FormattingEnabled = true;
-            lstMessages.Location = new Point(428, 48);
+            lstMessages.Location = new Point(941, 48);
             lstMessages.Margin = new Padding(4, 5, 4, 5);
             lstMessages.Name = "lstMessages";
-            lstMessages.Size = new Size(461, 403);
+            lstMessages.Size = new Size(427, 517);
             lstMessages.TabIndex = 12;
             lstMessages.SelectedIndexChanged += lstMessages_SelectedIndexChanged;
             // 
             // txtReply
             // 
-            txtReply.Location = new Point(428, 562);
+            txtReply.Location = new Point(426, 533);
             txtReply.Margin = new Padding(4, 5, 4, 5);
             txtReply.Name = "txtReply";
-            txtReply.Size = new Size(607, 27);
+            txtReply.Size = new Size(494, 27);
             txtReply.TabIndex = 13;
             // 
             // btnSendReply
             // 
-            btnSendReply.Location = new Point(1044, 554);
+            btnSendReply.Location = new Point(808, 580);
             btnSendReply.Margin = new Padding(4, 5, 4, 5);
             btnSendReply.Name = "btnSendReply";
             btnSendReply.Size = new Size(112, 40);
@@ -207,21 +208,12 @@
             // 
             lblReplyTarget.AutoSize = true;
             lblReplyTarget.Font = new Font("新細明體", 9F, FontStyle.Bold, GraphicsUnit.Point, 136);
-            lblReplyTarget.Location = new Point(428, 542);
+            lblReplyTarget.Location = new Point(426, 513);
             lblReplyTarget.Margin = new Padding(4, 0, 4, 0);
             lblReplyTarget.Name = "lblReplyTarget";
             lblReplyTarget.Size = new Size(151, 15);
             lblReplyTarget.TabIndex = 15;
             lblReplyTarget.Text = "回覆對象：尚未選擇";
-            // 
-            // txtForwardChannelId
-            // 
-            txtForwardChannelId.Location = new Point(553, 495);
-            txtForwardChannelId.Margin = new Padding(4, 5, 4, 5);
-            txtForwardChannelId.Name = "txtForwardChannelId";
-            txtForwardChannelId.Size = new Size(202, 27);
-            txtForwardChannelId.TabIndex = 16;
-            txtForwardChannelId.Text = "1484034366685450240";
             // 
             // label1
             // 
@@ -263,21 +255,11 @@
             label4.TabIndex = 20;
             label4.Text = "延遲區間(秒): ";
             // 
-            // label5
-            // 
-            label5.AutoSize = true;
-            label5.Location = new Point(424, 498);
-            label5.Margin = new Padding(4, 0, 4, 0);
-            label5.Name = "label5";
-            label5.Size = new Size(121, 19);
-            label5.TabIndex = 21;
-            label5.Text = "私訊轉發頻道 ID:";
-            // 
             // lblStatus
             // 
             lblStatus.AutoSize = true;
             lblStatus.ForeColor = Color.Gray;
-            lblStatus.Location = new Point(424, 19);
+            lblStatus.Location = new Point(941, 9);
             lblStatus.Margin = new Padding(4, 0, 4, 0);
             lblStatus.Name = "lblStatus";
             lblStatus.Size = new Size(84, 19);
@@ -286,16 +268,17 @@
             // 
             // label7
             // 
-            label7.Location = new Point(259, 500);
+            label7.AutoSize = true;
+            label7.Location = new Point(285, 12);
             label7.Margin = new Padding(4, 0, 4, 0);
             label7.Name = "label7";
-            label7.Size = new Size(17, 24);
+            label7.Size = new Size(102, 19);
             label7.TabIndex = 24;
-            label7.Text = "~";
+            label7.Text = "目前對話視窗:";
             // 
             // btnFetchDMs
             // 
-            btnFetchDMs.Location = new Point(907, 36);
+            btnFetchDMs.Location = new Point(426, 16);
             btnFetchDMs.Name = "btnFetchDMs";
             btnFetchDMs.Size = new Size(180, 31);
             btnFetchDMs.TabIndex = 0;
@@ -304,15 +287,15 @@
             // 
             // lstDMs
             // 
-            lstDMs.Location = new Point(907, 67);
+            lstDMs.Location = new Point(426, 45);
             lstDMs.Name = "lstDMs";
-            lstDMs.Size = new Size(180, 384);
+            lstDMs.Size = new Size(180, 460);
             lstDMs.TabIndex = 1;
             lstDMs.SelectedIndexChanged += lstDMs_SelectedIndexChanged;
             // 
             // btnClearLogs
             // 
-            btnClearLogs.Location = new Point(762, 451);
+            btnClearLogs.Location = new Point(1241, 573);
             btnClearLogs.Name = "btnClearLogs";
             btnClearLogs.Size = new Size(127, 29);
             btnClearLogs.TabIndex = 25;
@@ -329,22 +312,52 @@
             label6.TabIndex = 26;
             label6.Text = "~";
             // 
+            // txtChatHistory
+            // 
+            txtChatHistory.BackColor = Color.White;
+            txtChatHistory.Location = new Point(612, 16);
+            txtChatHistory.Multiline = true;
+            txtChatHistory.Name = "txtChatHistory";
+            txtChatHistory.ReadOnly = true;
+            txtChatHistory.ScrollBars = ScrollBars.Vertical;
+            txtChatHistory.Size = new Size(309, 489);
+            txtChatHistory.TabIndex = 27;
+            // 
+            // txtForwardChannelId
+            // 
+            txtForwardChannelId.Enabled = false;
+            txtForwardChannelId.Location = new Point(426, 593);
+            txtForwardChannelId.Name = "txtForwardChannelId";
+            txtForwardChannelId.Size = new Size(263, 27);
+            txtForwardChannelId.TabIndex = 28;
+            txtForwardChannelId.Text = "1484034366685450240";
+            // 
+            // label5
+            // 
+            label5.AutoSize = true;
+            label5.Font = new Font("新細明體", 9F, FontStyle.Bold, GraphicsUnit.Point, 136);
+            label5.Location = new Point(426, 570);
+            label5.Margin = new Padding(4, 0, 4, 0);
+            label5.Name = "label5";
+            label5.Size = new Size(71, 15);
+            label5.TabIndex = 29;
+            label5.Text = "發送頻道";
+            // 
             // Form1
             // 
             AutoScaleDimensions = new SizeF(9F, 19F);
             AutoScaleMode = AutoScaleMode.Font;
-            ClientSize = new Size(1176, 871);
+            ClientSize = new Size(1381, 871);
+            Controls.Add(label5);
+            Controls.Add(txtForwardChannelId);
             Controls.Add(label6);
             Controls.Add(btnFetchDMs);
             Controls.Add(lstDMs);
-            Controls.Add(label7);
             Controls.Add(lblStatus);
-            Controls.Add(label5);
             Controls.Add(label4);
             Controls.Add(label3);
             Controls.Add(label2);
             Controls.Add(label1);
-            Controls.Add(txtForwardChannelId);
             Controls.Add(lblReplyTarget);
             Controls.Add(btnSendReply);
             Controls.Add(txtReply);
@@ -362,6 +375,8 @@
             Controls.Add(btnConnectWS);
             Controls.Add(txtTokens);
             Controls.Add(btnClearLogs);
+            Controls.Add(txtChatHistory);
+            Controls.Add(label7);
             Margin = new Padding(4, 5, 4, 5);
             Name = "Form1";
             Text = "Chihlin - Discord 整合控制台 V2";
@@ -370,7 +385,6 @@
             ((System.ComponentModel.ISupportInitialize)numMaxDelay).EndInit();
             ResumeLayout(false);
             PerformLayout();
-
         }
 
         #endregion
@@ -391,17 +405,18 @@
         private System.Windows.Forms.TextBox txtReply;
         private System.Windows.Forms.Button btnSendReply;
         private System.Windows.Forms.Label lblReplyTarget;
-        private System.Windows.Forms.TextBox txtForwardChannelId;
         private System.Windows.Forms.Label label1;
         private System.Windows.Forms.Label label2;
         private System.Windows.Forms.Label label3;
         private System.Windows.Forms.Label label4;
-        private System.Windows.Forms.Label label5;
         private System.Windows.Forms.Label lblStatus;
         private Label label7;
         private System.Windows.Forms.Button btnFetchDMs;
         private System.Windows.Forms.ListBox lstDMs;
         private System.Windows.Forms.Button btnClearLogs;
         private Label label6;
+        private System.Windows.Forms.TextBox txtChatHistory;
+        private TextBox txtForwardChannelId;
+        private Label label5;
     }
 }

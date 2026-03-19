@@ -112,7 +112,6 @@ namespace DiscordAutoChat
                         AppendLog($"[系統] 登入成功！您的 ID 是: {_myUserId}");
                     }
 
-                    // 3. 接收訊息事件
                     if (!string.IsNullOrEmpty(t) && t.Equals("MESSAGE_CREATE", StringComparison.OrdinalIgnoreCase))
                     {
                         var d = data["d"];
@@ -121,56 +120,68 @@ namespace DiscordAutoChat
                         string content = d["content"].ToString();
                         string channelId = d["channel_id"].ToString();
 
-                        // 判斷是否為私訊 (guild_id 為空)
-                        if (d["guild_id"] == null)
+                        // 1. 排除自己發出的訊息
+                        if (authorId != _myUserId)
                         {
-                            string forwardText = "";
+                            bool isNewArrival = false;
+                            string currentTime = DateTime.Now.ToString("HH:mm"); // 取得目前時間
 
-                            if (authorId == _myUserId)
-                            {
-                                // A. 如果是我發出的 (回覆別人)
-                                // 從字典反查這個頻道 ID 是屬於哪個使用者的
-                                string targetName = _userChannels.FirstOrDefault(x => x.Value == channelId).Key ?? "未知對象";
-                                forwardText = $"【回覆給 {targetName}】: {content}";
+                            // --- 核心判斷：檢查 lstMessages (中間對話框) ---
+                            this.Invoke((MethodInvoker)delegate {
+                                bool foundInLog = false;
 
-                                this.Invoke((MethodInvoker)delegate {
-                                    lstMessages.Items.Add($"> [回覆 {targetName}]: {content}");
-                                });
-                            }
-                            else
-                            {
-                                // B. 如果是對方發來的
-                                forwardText = $"【收到來自 {authorName}】: {content}";
-
-                                this.Invoke((MethodInvoker)delegate {
-                                    // 自動記憶此對話，方便之後主動回覆
-                                    if (!_userChannels.ContainsKey(authorName)) _userChannels[authorName] = channelId;
-                                    lstMessages.Items.Add($"[{authorName}]: {content}");
-                                });
-                            }
-
-                            // 4. 執行安全轉發邏輯
-                            string forwardId = txtForwardChannelId.Text.Trim();
-                            if (!string.IsNullOrEmpty(forwardId))
-                            {
-                                // --- 防封鎖：強制延遲保護 ---
-                                double elapsed = (DateTime.Now - _lastForwardTime).TotalMilliseconds;
-                                int minDelay = random.Next(10000, 15000); // 隨機延遲 10 ~ 15 秒
-
-                                if (elapsed < minDelay)
+                                // 遍歷目前的列表，尋找是否有該使用者的名字標記
+                                foreach (var item in lstMessages.Items)
                                 {
-                                    int waitTime = minDelay - (int)elapsed;
-                                    // AppendLog($"[安全] 轉發冷卻中，等待 {waitTime}ms...");
-                                    await Task.Delay(waitTime);
+                                    // 比對格式範例： "[18:30] [Username]: ..." 
+                                    // 只要包含 "[Username]" 就代表這人在清單中
+                                    if (item.ToString().Contains($"[{authorName}]"))
+                                    {
+                                        foundInLog = true;
+                                        break;
+                                    }
                                 }
 
-                                // 模擬打字效果 (更像真人)
-                                await SendTypingIndicator(forwardId, currentToken);
-                                await Task.Delay(random.Next(2000, 5000));
+                                // 組合顯示文字： [時間] [名字]: 內容
+                                string displayLine = $"[{currentTime}] [{authorName}]: {content}";
 
-                                // 正式轉發
-                                await SendDiscordMessage(forwardId, currentToken, forwardText);
-                                _lastForwardTime = DateTime.Now; // 更新最後轉發時間
+                                if (!foundInLog)
+                                {
+                                    isNewArrival = true;
+                                    // 發現新 ID，加入列表
+                                    lstMessages.Items.Add(displayLine);
+
+                                    // 同步更新左側清單與字典
+                                    if (!lstDMs.Items.Contains(authorName)) lstDMs.Items.Add(authorName);
+                                    if (!_userChannels.ContainsKey(authorName)) _userChannels[authorName] = channelId;
+                                }
+                                else
+                                {
+                                    // 已存在的 ID，直接增加對話行，不觸發警報
+                                    lstMessages.Items.Add(displayLine);
+                                }
+
+                                // 如果目前正選中此人，同步更新右側歷史框
+                                if (_selectedChannelId == channelId)
+                                {
+                                    txtChatHistory.AppendText($"{displayLine}\r\n");
+                                }
+                            });
+
+                            // --- 2. 如果是「新出現的 ID」，執行轉發提醒 ---
+                            if (isNewArrival)
+                            {
+                                string forwardId = txtForwardChannelId.Text.Trim();
+                                if (!string.IsNullOrEmpty(forwardId))
+                                {
+                                    // 執行安全延遲與轉發
+                                    await Task.Delay(random.Next(1000, 2000));
+
+                                    string alertMsg = $"【🔔 新未回覆提醒】";
+                                    await SendDiscordMessage(forwardId, currentToken, alertMsg);
+
+                                    AppendLog($"[警報] 已將新 ID [{authorName}] 轉發至提醒頻道。");
+                                }
                             }
                         }
                     }
@@ -332,10 +343,48 @@ namespace DiscordAutoChat
 
         private async void btnSendReply_Click(object sender, EventArgs e)
         {
-            if (string.IsNullOrEmpty(_selectedChannelId)) return;
-            string token = txtTokens.Lines.FirstOrDefault();
-            await SendDiscordMessage(_selectedChannelId, token, txtReply.Text);
-            txtReply.Clear();
+            // 1. 基本檢查
+            if (string.IsNullOrEmpty(_selectedChannelId))
+            {
+                MessageBox.Show("請先從清單中選擇回覆對象！");
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(txtReply.Text)) return;
+
+            string token = txtTokens.Lines.FirstOrDefault()?.Trim();
+            string messageContent = txtReply.Text;
+
+            // 2. UI 鎖定與狀態提示
+            btnSendReply.Enabled = false;           // 鎖定按鈕防止重複點擊
+            string originalText = btnSendReply.Text;
+            btnSendReply.Text = "傳送中...";         // 視覺回饋
+            txtReply.ReadOnly = true;               // 暫時鎖定輸入框
+
+            try
+            {
+                // 3. 執行發送 (包含我們之前的打字偽裝)
+                await SendTypingIndicator(_selectedChannelId, token);
+                await Task.Delay(random.Next(800, 1500)); // 模擬人類打字時間
+
+                await SendDiscordMessage(_selectedChannelId, token, messageContent);
+
+                // 4. 成功後的處理
+                AppendLog($"[成功] 已回覆訊息至 ID: {_selectedChannelId}");
+                txtReply.Clear(); // 清空輸入框
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[失敗] 回覆失敗: {ex.Message}");
+                MessageBox.Show($"傳送失敗：{ex.Message}", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                // 5. 無論成功或失敗，最後都恢復 UI 狀態
+                btnSendReply.Enabled = true;
+                btnSendReply.Text = originalText;
+                txtReply.ReadOnly = false;
+                txtReply.Focus(); // 重新聚焦，方便下次輸入
+            }
         }
 
         // 1. 點擊按鈕後，向 Discord 請求所有的私訊頻道
@@ -387,30 +436,33 @@ namespace DiscordAutoChat
         }
 
         // 2. 當點擊右側列表中的名字時，切換目前要發送訊息的對象
-        private void lstDMs_SelectedIndexChanged(object sender, EventArgs e)
+        private async void lstDMs_SelectedIndexChanged(object sender, EventArgs e)
         {
             if (lstDMs.SelectedItem == null) return;
-            string name = lstDMs.SelectedItem.ToString();
 
+            string name = lstDMs.SelectedItem.ToString();
             if (_userChannels.TryGetValue(name, out string cid))
             {
                 _selectedChannelId = cid;
-                lblReplyTarget.Text = $"主動發訊對象：{name}";
-                AppendLog($"已切換目標為: {name} (ID: {cid})");
+                lblReplyTarget.Text = $"目標：{name}";
+
+                // 觸發讀取對話內容
+                await FetchChatHistory(cid);
             }
         }
 
 
         private void btnClearLogs_Click(object sender, EventArgs e)
         {
-            // 清除中間的 ListBox (對話紀錄)
+            // 核心：清空這個列表，偵測機制就會重置
             lstMessages.Items.Clear();
-            // 清除底部的 TextBox (系統運行 Log)
-            txtLog.Clear();
-            // 選用：重設目前選取的對話目標 (避免誤發)
-            _selectedChannelId = "";
-            lblReplyTarget.Text = "回覆對象：尚未選擇";
-            AppendLog("[系統] 已清除所有畫面訊息。");
+
+            // 選用：清空左側名字列表與歷史框
+            lstDMs.Items.Clear();
+            txtChatHistory.Clear();
+            _userChannels.Clear();
+
+            AppendLog("[系統] 已清除所有緩存，新訊息將重新觸發提醒。");
         }
 
         private async Task SendTypingIndicator(string channelId, string token)
@@ -420,6 +472,110 @@ namespace DiscordAutoChat
             {
                 request.Headers.TryAddWithoutValidation("Authorization", token);
                 try { await client.SendAsync(request); } catch { }
+            }
+        }
+
+
+        // 新增讀取歷史訊息的方法
+        private async Task FetchChatHistory(string channelId)
+        {
+            string token = txtTokens.Lines.FirstOrDefault()?.Trim();
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(channelId)) return;
+
+            // UI 初始狀態回饋
+            txtChatHistory.Text = "正在讀取對話紀錄...";
+
+            // Discord API: 獲取頻道訊息 (limit=25 則通常足以查看上下文)
+            string url = $"https://discord.com/api/v9/channels/{channelId}/messages?limit=25";
+
+            using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+            {
+                request.Headers.TryAddWithoutValidation("Authorization", token);
+
+                try
+                {
+                    var response = await client.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string json = await response.Content.ReadAsStringAsync();
+                        var messages = JArray.Parse(json);
+
+                        if (messages.Count > 0)
+                        {
+                            // --- 1. 標記已讀 (消除 Discord 驚嘆號) ---
+                            // 取最新的訊息 ID (通常是第一筆) 發送 Ack
+                            string latestMsgId = messages[0]["id"].ToString();
+                            await MarkAsRead(channelId, latestMsgId, token);
+
+                            // --- 2. 格式化訊息內容 ---
+                            StringBuilder sb = new StringBuilder();
+
+                            // API 回傳是從新到舊 (Index 0 是最新)，我們反轉為從舊到新顯示
+                            foreach (var msg in messages.Reverse())
+                            {
+                                string author = msg["author"]["username"].ToString();
+                                string content = msg["content"].ToString();
+
+                                // 處理時間：從 UTC 轉為在地時間 (如 GMT+8)
+                                DateTime timestamp = DateTime.Parse(msg["timestamp"].ToString()).ToLocalTime();
+                                string timeStr = timestamp.ToString("MM/dd HH:mm");
+
+                                // 區分「我」與「對方」的視覺感 (選用)
+                                if (msg["author"]["id"].ToString() == _myUserId)
+                                    sb.AppendLine($"[{timeStr}] <我>: {content}");
+                                else
+                                    sb.AppendLine($"[{timeStr}] {author}: {content}");
+                            }
+
+                            // --- 3. 更新 UI ---
+                            txtChatHistory.Text = sb.ToString();
+
+                            // 自動捲動到最底端 (Focus 在最新訊息)
+                            txtChatHistory.SelectionStart = txtChatHistory.Text.Length;
+                            txtChatHistory.ScrollToCaret();
+                        }
+                        else
+                        {
+                            txtChatHistory.Text = "此頻道尚無訊息。";
+                        }
+                    }
+                    else
+                    {
+                        txtChatHistory.Text = $"無法讀取訊息。錯誤碼: {response.StatusCode}";
+                        AppendLog($"[錯誤] FetchChatHistory 失敗: {response.StatusCode}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    txtChatHistory.Text = $"讀取發生異常: {ex.Message}";
+                    AppendLog($"[異常] FetchChatHistory 崩潰: {ex.Message}");
+                }
+            }
+        }
+
+
+        private async Task MarkAsRead(string channelId, string messageId, string token)
+        {
+            // Discord API 標記已讀的端點
+            string url = $"https://discord.com/api/v9/channels/{channelId}/messages/{messageId}/ack";
+
+            // Ack 請求通常需要一個空 JSON 或 token 驗證
+            var payload = new { token = (string)null };
+
+            using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+            {
+                request.Headers.TryAddWithoutValidation("Authorization", token);
+                request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+
+                try
+                {
+                    var response = await client.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        // AppendLog($"[系統] 頻道 {channelId} 已標記為已讀。");
+                    }
+                }
+                catch { /* 忽略失敗 */ }
             }
         }
         private void Form1_Load(object sender, EventArgs e)

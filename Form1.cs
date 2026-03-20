@@ -22,7 +22,12 @@ namespace DiscordAutoChat
         private Dictionary<string, string> _userChannels = new Dictionary<string, string>();
         private string _selectedChannelId = "";
         private string _myUserId = "";
-
+        private string myBotToken = "MTQ4Mzc0MzcxNDY3MjExNTcxMg.G3V6QC.PvoRARBnAXlc1H9RWtCUlXVo05Z5J-7nj_S2HM";
+        private Dictionary<string, string> _tagRules = new Dictionary<string, string>();
+        private string _configPath = "config.json";
+        // 記錄標記歷史：Key = "AuthorID_Tag", Value = 觸發時間
+        private Dictionary<string, DateTime> _lastMentionTimes = new Dictionary<string, DateTime>();
+        private readonly TimeSpan _mentionCooldown = TimeSpan.FromMinutes(5);
         public Form1()
         {
             InitializeComponent();
@@ -31,7 +36,64 @@ namespace DiscordAutoChat
             if (!client.DefaultRequestHeaders.Contains("User-Agent"))
                 client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         }
+        // 讀取設定檔並套用到 UI
+        private void LoadConfig()
+        {
+            try
+            {
+                if (System.IO.File.Exists(_configPath))
+                {
+                    string json = System.IO.File.ReadAllText(_configPath);
+                    var config = JsonConvert.DeserializeObject<AppConfig>(json);
 
+                    if (config != null)
+                    {
+                        txtTokens.Text = config.Tokens;
+                        txtChannels.Text = config.Channels;
+                        txtMessages.Text = config.Messages; // 載入發文內容
+                        numMinDelay.Value = config.MinDelay;
+                        numMaxDelay.Value = config.MaxDelay;
+                        txtBotToken.Text = config.BotToken;
+                        txtTargetChannelId.Text = config.TargetChannelId;
+
+                        // 載入關鍵字規則
+                        _tagRules = config.TagRules ?? new Dictionary<string, string>();
+                        lstTagRules.Items.Clear();
+                        foreach (var rule in _tagRules)
+                        {
+                            lstTagRules.Items.Add($"{rule.Key} -> {rule.Value}");
+                        }
+                        AppendLog("[系統] 設定檔已成功載入。");
+                    }
+                }
+            }
+            catch (Exception ex) { AppendLog($"[系統錯誤] 讀取設定失敗: {ex.Message}"); }
+        }
+
+        // 抓取 UI 目前狀態並存檔
+        private void SaveConfig()
+        {
+            try
+            {
+                var config = new AppConfig
+                {
+                    Tokens = txtTokens.Text,
+                    Channels = txtChannels.Text,
+                    Messages = txtMessages.Text, // 儲存發文內容
+                    MinDelay = numMinDelay.Value,
+                    MaxDelay = numMaxDelay.Value,
+                    BotToken = txtBotToken.Text,
+                    TargetChannelId = txtTargetChannelId.Text,
+                    TagRules = _tagRules
+                };
+
+                string json = JsonConvert.SerializeObject(config, Formatting.Indented);
+                System.IO.File.WriteAllText(_configPath, json);
+
+                CleanOldMentions();
+            }
+            catch (Exception ex) { AppendLog($"[系統錯誤] 儲存設定失敗: {ex.Message}"); }
+        }
         private void AppendLog(string message)
         {
             if (txtLog.InvokeRequired) { txtLog.Invoke(new Action(() => AppendLog(message))); return; }
@@ -129,7 +191,8 @@ namespace DiscordAutoChat
                             string currentTime = DateTime.Now.ToString("HH:mm");
 
                             // --- 第一步：UI 判斷與顯示 (Invoke) ---
-                            this.Invoke((MethodInvoker)delegate {
+                            this.Invoke((MethodInvoker)delegate
+                            {
                                 bool foundInLog = false;
                                 // 檢查中間對話框 lstMessages 是否已有此人名字
                                 foreach (var item in lstMessages.Items)
@@ -148,8 +211,7 @@ namespace DiscordAutoChat
                                     isNewArrival = true;
                                     lstMessages.Items.Add(displayLine);
 
-                                    // 更新左側列表與字典
-                                    if (!lstDMs.Items.Contains(authorName)) lstDMs.Items.Add(authorName);
+                                    // 更新左側列表與字典 
                                     if (!_userChannels.ContainsKey(authorName)) _userChannels[authorName] = channelId;
                                 }
                                 else
@@ -161,36 +223,68 @@ namespace DiscordAutoChat
                                 // 自動捲動到底部
                                 lstMessages.TopIndex = lstMessages.Items.Count - 1;
 
-                                // 如果正在查看此對話，更新歷史框
-                                if (_selectedChannelId == channelId)
-                                {
-                                    txtChatHistory.AppendText($"{displayLine}\r\n");
-                                }
+
                             });
 
-                            // --- 第二步：針對新 ID 的自動處理 ---
-                            if (isNewArrival)
+                            // --- 第二步：標記與轉發邏輯處理 (含 5 分鐘冷卻機制) ---
+                            string currentBotToken = txtBotToken.Text.Trim();
+                            string currentAdminChannel = txtTargetChannelId.Text.Trim();
+
+                            if (!string.IsNullOrEmpty(currentBotToken) && !string.IsNullOrEmpty(currentAdminChannel))
                             {
-                                // A. 如果是陌生私訊，執行「接受請求」
-                                if (isPrivate)
+                                List<string> tagsToSend = new List<string>();
+                                bool shouldForward = false;
+                                DateTime now = DateTime.Now;
+
+                                // A. 判斷是否為「新 ID」：標記 @everyone
+                                if (isNewArrival)
                                 {
-                                    await AcceptMessageRequest(channelId, currentToken);
-                                    await Task.Delay(500); // 緩衝
+                                    string tagKey = $"{authorId}_everyone";
+                                    if (!_lastMentionTimes.ContainsKey(tagKey) || (now - _lastMentionTimes[tagKey]) > _mentionCooldown)
+                                    {
+                                        tagsToSend.Add("@everyone");
+                                        _lastMentionTimes[tagKey] = now;
+                                        shouldForward = true;
+                                    }
                                 }
 
-                                // B. 發送「新 ID 提醒」到轉發頻道
-                                string forwardId = txtForwardChannelId.Text.Trim();
-                                if (!string.IsNullOrEmpty(forwardId))
+                                // B. 判斷「關鍵字」：標記當事人
+                                HashSet<string> matchedIds = new HashSet<string>();
+                                foreach (var rule in _tagRules)
                                 {
-                                    // 延遲隨機時間避開系統偵測
-                                    await Task.Delay(random.Next(2000, 4000));
-                                    string alertMsg = $"【🔔 偵測到新未回覆 ID】";
-                                    await SendDiscordMessage(forwardId, currentToken, alertMsg);
+                                    if (content.Contains(rule.Key, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        string tagKey = $"{authorId}_{rule.Value}";
+                                        // 檢查該使用者針對此標記是否過期
+                                        if (!_lastMentionTimes.ContainsKey(tagKey) || (now - _lastMentionTimes[tagKey]) > _mentionCooldown)
+                                        {
+                                            matchedIds.Add(rule.Value);
+                                            _lastMentionTimes[tagKey] = now;
+                                            shouldForward = true;
+                                        }
+                                    }
+                                }
+
+                                foreach (var id in matchedIds)
+                                {
+                                    tagsToSend.Add($"<@{id}>");
+                                }
+
+                                // C. 執行轉發：只有在有「新的有效標記」時才發送
+                                if (shouldForward && tagsToSend.Count > 0)
+                                {
+                                    string mentionString = string.Join(" ", tagsToSend.Distinct());
+                                    await ForwardToAdminChannel(currentAdminChannel, currentBotToken, authorName, content, mentionString);
+
+                                    AppendLog($"[轉發] 已標記 {mentionString}。 (下次標記此人需等 5 分鐘)");
+                                }
+                                else if (shouldForward == false && isNewArrival)
+                                {
+                                    // 雖然是新 ID，但如果在冷卻中，我們可以選擇只顯示在 UI 不轉發
+                                    AppendLog($"[忽略] {authorName} 頻繁觸發，5 分鐘內不重複轉發標記。");
                                 }
                             }
 
-                            // --- 第三步：自動標記已讀 ---
-                            await MarkAsRead(channelId, messageId, currentToken);
                         }
                     }
                 }
@@ -283,7 +377,8 @@ namespace DiscordAutoChat
             finally
             {
                 // 確保按鈕狀態恢復
-                this.Invoke((MethodInvoker)delegate {
+                this.Invoke((MethodInvoker)delegate
+                {
                     btnStart.Enabled = true;
                     btnStop.Enabled = false;
                 });
@@ -295,15 +390,15 @@ namespace DiscordAutoChat
             // 1. 先模擬打字
             await SendTypingIndicator(channelId, auth);
             // 2. 模擬打字需要時間 (隨機 1.5 ~ 3 秒)
-            await Task.Delay(random.Next(5000, 10000));
+            await Task.Delay(random.Next(1500, 3000));
 
-            var url = $"https://discord.com/api/v9/channels/{channelId}/messages";
+            var url = $"https://discord.com/api/v10/channels/{channelId}/messages";
             var payload = new { content = text, tts = false };
             using (var request = new HttpRequestMessage(HttpMethod.Post, url))
             {
                 request.Headers.TryAddWithoutValidation("Authorization", auth);
                 request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-                try { await client.SendAsync(request); } catch (Exception ex){ AppendLog($"發送文案失敗錯誤原因 : {ex}"); }
+                try { await client.SendAsync(request); } catch (Exception ex) { AppendLog($"發送文案失敗錯誤原因 : {ex}"); }
             }
         }
 
@@ -333,143 +428,16 @@ namespace DiscordAutoChat
             }
         }
 
-        private void lstMessages_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            if (lstMessages.SelectedItem == null) return;
-            string line = lstMessages.SelectedItem.ToString();
-            if (line.Contains("[") && line.Contains("]:"))
-            {
-                string name = line.Substring(1, line.IndexOf("]:") - 1);
-                if (_userChannels.TryGetValue(name, out string cid))
-                {
-                    _selectedChannelId = cid;
-                    lblReplyTarget.Text = $"回覆對象：{name}";
-                }
-            }
-        }
 
-        private async void btnSendReply_Click(object sender, EventArgs e)
-        {
-            // 1. 基本檢查
-            if (string.IsNullOrEmpty(_selectedChannelId))
-            {
-                MessageBox.Show("請先從清單中選擇回覆對象！");
-                return;
-            }
-            if (string.IsNullOrWhiteSpace(txtReply.Text)) return;
 
-            string token = txtTokens.Lines.FirstOrDefault()?.Trim();
-            string messageContent = txtReply.Text;
-
-            // 2. UI 鎖定與狀態提示
-            btnSendReply.Enabled = false;           // 鎖定按鈕防止重複點擊
-            string originalText = btnSendReply.Text;
-            btnSendReply.Text = "傳送中...";         // 視覺回饋
-            txtReply.ReadOnly = true;               // 暫時鎖定輸入框
-
-            try
-            {
-                // 3. 執行發送 (包含我們之前的打字偽裝)
-                await SendTypingIndicator(_selectedChannelId, token);
-                await Task.Delay(random.Next(800, 1500)); // 模擬人類打字時間
-
-                await SendDiscordMessage(_selectedChannelId, token, messageContent);
-
-                // 4. 成功後的處理
-                AppendLog($"[成功] 已回覆訊息至 ID: {_selectedChannelId}");
-                txtReply.Clear(); // 清空輸入框
-            }
-            catch (Exception ex)
-            {
-                AppendLog($"[失敗] 回覆失敗: {ex.Message}");
-                MessageBox.Show($"傳送失敗：{ex.Message}", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-            finally
-            {
-                // 5. 無論成功或失敗，最後都恢復 UI 狀態
-                btnSendReply.Enabled = true;
-                btnSendReply.Text = originalText;
-                txtReply.ReadOnly = false;
-                txtReply.Focus(); // 重新聚焦，方便下次輸入
-            }
-        }
-
-        // 1. 點擊按鈕後，向 Discord 請求所有的私訊頻道
-        private async void btnFetchDMs_Click(object sender, EventArgs e)
-        {
-            string token = txtTokens.Lines.FirstOrDefault()?.Trim();
-            if (string.IsNullOrEmpty(token)) return;
-
-            AppendLog("正在讀取私訊列表...");
-            string url = "https://discord.com/api/v9/users/@me/channels";
-
-            using (var request = new HttpRequestMessage(HttpMethod.Get, url))
-            {
-                request.Headers.TryAddWithoutValidation("Authorization", token);
-                try
-                {
-                    var response = await client.SendAsync(request);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        string json = await response.Content.ReadAsStringAsync();
-                        var channels = JArray.Parse(json);
-
-                        lstDMs.Items.Clear();
-                        foreach (var channel in channels)
-                        {
-                            // 取得對方名稱 (如果是私訊，會有 recipients 陣列)
-                            var recipients = channel["recipients"];
-                            if (recipients != null && recipients.HasValues)
-                            {
-                                string username = recipients[0]["username"].ToString();
-                                string channelId = channel["id"].ToString();
-
-                                // 存入字典以便點擊使用
-                                if (!_userChannels.ContainsKey(username))
-                                    _userChannels.Add(username, channelId);
-
-                                lstDMs.Items.Add(username);
-                            }
-                        }
-                        AppendLog($"成功讀取 {lstDMs.Items.Count} 個對話對象。");
-                    }
-                    else
-                    {
-                        AppendLog($"讀取失敗: {response.StatusCode}");
-                    }
-                }
-                catch (Exception ex) { AppendLog($"讀取發生異常: {ex.Message}"); }
-            }
-        }
-
-        // 2. 當點擊右側列表中的名字時，切換目前要發送訊息的對象
-        private async void lstDMs_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            if (lstDMs.SelectedItem == null) return;
-
-            string name = lstDMs.SelectedItem.ToString();
-            if (_userChannels.TryGetValue(name, out string cid))
-            {
-                _selectedChannelId = cid;
-                lblReplyTarget.Text = $"目標：{name}";
-
-                // 觸發讀取對話內容
-                await FetchChatHistory(cid);
-            }
-        }
 
 
         private void btnClearLogs_Click(object sender, EventArgs e)
         {
             // 核心：清空這個列表，偵測機制就會重置
             lstMessages.Items.Clear();
-
-            // 選用：清空左側名字列表與歷史框
-            lstDMs.Items.Clear();
-            txtChatHistory.Clear();
             _userChannels.Clear();
-
-            AppendLog("[系統] 已清除所有緩存，新訊息將重新觸發提醒。");
+            AppendLog("[系統] 已清除所有緩存。");
         }
 
         private async Task SendTypingIndicator(string channelId, string token)
@@ -481,140 +449,205 @@ namespace DiscordAutoChat
                 try { await client.SendAsync(request); } catch { }
             }
         }
-
-
-        // 新增讀取歷史訊息的方法
-        private async Task FetchChatHistory(string channelId)
+        private void Form1_Load(object sender, EventArgs e)
         {
-            string token = txtTokens.Lines.FirstOrDefault()?.Trim();
-            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(channelId)) return;
+            LoadConfig(); // 啟動時讀取
+            AppendLog("系統啟動成功。");
 
-            // UI 初始狀態回饋
-            txtChatHistory.Text = "正在讀取對話紀錄...";
-
-            // Discord API: 獲取頻道訊息 (limit=25 則通常足以查看上下文)
-            string url = $"https://discord.com/api/v9/channels/{channelId}/messages?limit=25";
-
-            using (var request = new HttpRequestMessage(HttpMethod.Get, url))
-            {
-                request.Headers.TryAddWithoutValidation("Authorization", token);
-
-                try
-                {
-                    var response = await client.SendAsync(request);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        string json = await response.Content.ReadAsStringAsync();
-                        var messages = JArray.Parse(json);
-
-                        if (messages.Count > 0)
-                        {
-                            // --- 1. 標記已讀 (消除 Discord 驚嘆號) ---
-                            // 取最新的訊息 ID (通常是第一筆) 發送 Ack
-                            string latestMsgId = messages[0]["id"].ToString();
-                            await MarkAsRead(channelId, latestMsgId, token);
-
-                            // --- 2. 格式化訊息內容 ---
-                            StringBuilder sb = new StringBuilder();
-
-                            // API 回傳是從新到舊 (Index 0 是最新)，我們反轉為從舊到新顯示
-                            foreach (var msg in messages.Reverse())
-                            {
-                                string author = msg["author"]["username"].ToString();
-                                string content = msg["content"].ToString();
-
-                                // 處理時間：從 UTC 轉為在地時間 (如 GMT+8)
-                                DateTime timestamp = DateTime.Parse(msg["timestamp"].ToString()).ToLocalTime();
-                                string timeStr = timestamp.ToString("MM/dd HH:mm");
-
-                                // 區分「我」與「對方」的視覺感 (選用)
-                                if (msg["author"]["id"].ToString() == _myUserId)
-                                    sb.AppendLine($"[{timeStr}] <我>: {content}");
-                                else
-                                    sb.AppendLine($"[{timeStr}] {author}: {content}");
-                            }
-
-                            // --- 3. 更新 UI ---
-                            txtChatHistory.Text = sb.ToString();
-
-                            // 自動捲動到最底端 (Focus 在最新訊息)
-                            txtChatHistory.SelectionStart = txtChatHistory.Text.Length;
-                            txtChatHistory.ScrollToCaret();
-                        }
-                        else
-                        {
-                            txtChatHistory.Text = "此頻道尚無訊息。";
-                        }
-                    }
-                    else
-                    {
-                        txtChatHistory.Text = $"無法讀取訊息。錯誤碼: {response.StatusCode}";
-                        AppendLog($"[錯誤] FetchChatHistory 失敗: {response.StatusCode}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    txtChatHistory.Text = $"讀取發生異常: {ex.Message}";
-                    AppendLog($"[異常] FetchChatHistory 崩潰: {ex.Message}");
-                }
-            }
         }
-
-
-        private async Task MarkAsRead(string channelId, string messageId, string token)
+        public async Task<string> GetOrCreateDMChannel(string userId, string botToken)
         {
-            // Discord API 標記已讀的端點
-            string url = $"https://discord.com/api/v9/channels/{channelId}/messages/{messageId}/ack";
-
-            // Ack 請求通常需要一個空 JSON 或 token 驗證
-            var payload = new { token = (string)null };
-
+            string url = "https://discord.com/api/v9/users/@me/channels";
             using (var request = new HttpRequestMessage(HttpMethod.Post, url))
             {
-                request.Headers.TryAddWithoutValidation("Authorization", token);
+                // Bot Token 的格式是 "Bot [TOKEN]"
+                request.Headers.TryAddWithoutValidation("Authorization", $"Bot {botToken}");
+
+                var payload = new { recipient_id = userId };
                 request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
 
-                try
+                var response = await client.SendAsync(request);
+                if (response.IsSuccessStatusCode)
                 {
-                    var response = await client.SendAsync(request);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        // AppendLog($"[系統] 頻道 {channelId} 已標記為已讀。");
-                    }
+                    var json = await response.Content.ReadAsStringAsync();
+                    return JObject.Parse(json)["id"].ToString(); // 這就是私訊頻道的 ID
                 }
-                catch { /* 忽略失敗 */ }
             }
+            return null;
         }
 
-        // 新增：自動接受陌生私訊的方法
-        private async Task AcceptMessageRequest(string channelId, string token)
+
+        // --- 機器人轉發方法 (使用漂亮的 Embed 格式) ---
+        public async Task ForwardToAdminChannel(string senderName, string messageContent)
         {
+            string botToken = txtBotToken.Text.Trim();
+            string targetChannelId = txtTargetChannelId.Text.Trim();
+
+            if (string.IsNullOrEmpty(botToken) || string.IsNullOrEmpty(targetChannelId)) return;
+
+            // 關鍵字匹配判斷
+            string mentionTag = "";
+            foreach (var rule in _tagRules)
+            {
+                if (messageContent.Contains(rule.Key, StringComparison.OrdinalIgnoreCase))
+                {
+                    mentionTag = $"<@{rule.Value}>"; // 格式化為 Discord Tag 語法
+                    break;
+                }
+            }
+
+            string url = $"https://discord.com/api/v10/channels/{targetChannelId}/messages";
             try
             {
-                // Discord API: 接受訊息請求的端點
-                string url = $"https://discord.com/api/v9/channels/{channelId}/recipients/consent";
-
                 using (var request = new HttpRequestMessage(HttpMethod.Post, url))
                 {
-                    request.Headers.TryAddWithoutValidation("Authorization", token);
-                    // 負載通常為空
-                    request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+                    request.Headers.TryAddWithoutValidation("Authorization", $"Bot {botToken}");
+
+                    var payload = new
+                    {
+                        content = $"{mentionTag} 📩 **收到新私訊**",
+                        embeds = new[] {
+                    new {
+                        title = "訊息詳情",
+                        color = 3447003,
+                        fields = new[] {
+                            new { name = "發送者", value = senderName, inline = true },
+                            new { name = "內容", value = messageContent, inline = false }
+                        },
+                        footer = new { text = "自動監控系統" }
+                    }
+                }
+                    };
+
+                    request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+                    var response = await client.SendAsync(request);
+
+                    if (response.IsSuccessStatusCode)
+                        AppendLog($"[Bot] 已成功轉發來自 {senderName} 的訊息。");
+                    else
+                        AppendLog($"[Bot 錯誤] 轉發失敗: {response.StatusCode}");
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[Bot 異常] {ex.Message}");
+            }
+        }
+        public async Task ForwardToAdminChannel(string channelId, string botToken, string senderName, string messageContent, string mentionTag)
+        {
+            string url = $"https://discord.com/api/v10/channels/{channelId}/messages";
+
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+                {
+                    request.Headers.TryAddWithoutValidation("Authorization", $"Bot {botToken.Trim()}");
+                    request.Headers.TryAddWithoutValidation("User-Agent", "DiscordBot (https://github.com/discord-net/Discord.Net, v3.13.0)");
+
+                    // 組合內容：Tag 放在 Embed 外面才會跳通知
+                    var payload = new
+                    {
+                        content = $"{(string.IsNullOrEmpty(mentionTag) ? "" : mentionTag + " ")}🔔 **【新私訊轉發】**",
+                        embeds = new[] {
+                                new {
+                                    title = "詳細訊息內容",
+                                    color = 3447003, // 藍色
+                                    fields = new[] {
+                                        new { name = "發送者", value = senderName, inline = true },
+                                        new { name = "內容", value = messageContent, inline = false }
+                                    },
+                                    footer = new { text = $"接收時間: {DateTime.Now:HH:mm:ss}" }
+                                }
+                            },
+                        allowed_mentions = new
+                        {
+                            parse = new[] { "everyone", "users", "roles" }
+                        }
+                    };
+
+                    request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
 
                     var response = await client.SendAsync(request);
-                    if (response.IsSuccessStatusCode)
+                    if (!response.IsSuccessStatusCode)
                     {
-                        AppendLog($"[系統] 已自動接受來自頻道 {channelId} 的陌生人訊息。");
+                        string error = await response.Content.ReadAsStringAsync();
+                        AppendLog($"[轉發錯誤] 狀態碼: {response.StatusCode}, 原因: {error}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                AppendLog($"[錯誤] 無法接受陌生請求: {ex.Message}");
+                AppendLog($"[連線異常] 機器人發送失敗: {ex.Message}");
             }
         }
-        private void Form1_Load(object sender, EventArgs e)
+        public async Task DebugCheckChannels(string botToken)
         {
+            string url = "https://discord.com/api/v10/users/@me/guilds";
+            using (var request = new HttpRequestMessage(HttpMethod.Get, url))
+            {
+                request.Headers.TryAddWithoutValidation("Authorization", $"Bot {botToken.Trim()}");
+                var response = await client.SendAsync(request);
+                string result = await response.Content.ReadAsStringAsync();
 
+                // 這會列出機器人所在的伺服器，如果連這都噴 403，就是 Token 錯了。
+                AppendLog($"[權限偵測] 機器人所在的伺服器資料: {result}");
+            }
+        }
+
+        private void btnAddRule_Click(object sender, EventArgs e)
+        {
+            string key = txtKeyword.Text.Trim();
+            string id = txtTagUserID.Text.Trim();
+
+            if (!string.IsNullOrEmpty(key) && !string.IsNullOrEmpty(id))
+            {
+                if (!_tagRules.ContainsKey(key))
+                {
+                    _tagRules.Add(key, id);
+                    lstTagRules.Items.Add($"{key} -> {id}");
+                    txtKeyword.Clear();
+                    txtTagUserID.Clear();
+                    AppendLog($"[系統] 已新增規則: 當訊息包含 '{key}' 時 Tag {id}");
+                }
+                else
+                {
+                    MessageBox.Show("此關鍵字已存在。");
+                }
+            }
+        }
+
+        private void btnDeleteRule_Click(object sender, EventArgs e)
+        {
+            if (lstTagRules.SelectedIndex != -1)
+            {
+                string selectedItem = lstTagRules.SelectedItem.ToString();
+                string key = selectedItem.Split(new string[] { " -> " }, StringSplitOptions.None)[0];
+
+                _tagRules.Remove(key);
+                lstTagRules.Items.RemoveAt(lstTagRules.SelectedIndex);
+                AppendLog($"[系統] 已刪除關鍵字規則: {key}");
+            }
+        }
+
+        public class AppConfig
+        {
+            public string Tokens { get; set; } = "";
+            public string Channels { get; set; } = "";
+            public string Messages { get; set; } = ""; // <--- 新增發文內容
+            public decimal MinDelay { get; set; } = 5;
+            public decimal MaxDelay { get; set; } = 10;
+            public string BotToken { get; set; } = "";
+            public string TargetChannelId { get; set; } = "";
+            // 儲存關鍵字規則：Key 是關鍵字, Value 是 ID
+            public Dictionary<string, string> TagRules { get; set; } = new Dictionary<string, string>();
+        }
+
+        private void CleanOldMentions()
+        {
+            var now = DateTime.Now;
+            var keysToRemove = _lastMentionTimes.Where(kv => (now - kv.Value) > _mentionCooldown)
+                                              .Select(kv => kv.Key).ToList();
+            foreach (var key in keysToRemove) _lastMentionTimes.Remove(key);
         }
     }
 }

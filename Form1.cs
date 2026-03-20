@@ -85,7 +85,6 @@ namespace DiscordAutoChat
         private DateTime _lastForwardTime = DateTime.MinValue;
         private async Task ReceiveLoop(string currentToken)
         {
-
             var buffer = new byte[1024 * 16]; // 16KB 緩衝區
             while (_ws.State == WebSocketState.Open)
             {
@@ -112,6 +111,7 @@ namespace DiscordAutoChat
                         AppendLog($"[系統] 登入成功！您的 ID 是: {_myUserId}");
                     }
 
+                    // 3. 接收訊息事件 (MESSAGE_CREATE)
                     if (!string.IsNullOrEmpty(t) && t.Equals("MESSAGE_CREATE", StringComparison.OrdinalIgnoreCase))
                     {
                         var d = data["d"];
@@ -119,22 +119,21 @@ namespace DiscordAutoChat
                         string authorName = d["author"]["username"].ToString();
                         string content = d["content"].ToString();
                         string channelId = d["channel_id"].ToString();
+                        string messageId = d["id"].ToString();
+                        bool isPrivate = (d["guild_id"] == null); // 是否為私訊
 
-                        // 1. 排除自己發出的訊息
+                        // 排除自己發送的訊息
                         if (authorId != _myUserId)
                         {
                             bool isNewArrival = false;
-                            string currentTime = DateTime.Now.ToString("HH:mm"); // 取得目前時間
+                            string currentTime = DateTime.Now.ToString("HH:mm");
 
-                            // --- 核心判斷：檢查 lstMessages (中間對話框) ---
+                            // --- 第一步：UI 判斷與顯示 (Invoke) ---
                             this.Invoke((MethodInvoker)delegate {
                                 bool foundInLog = false;
-
-                                // 遍歷目前的列表，尋找是否有該使用者的名字標記
+                                // 檢查中間對話框 lstMessages 是否已有此人名字
                                 foreach (var item in lstMessages.Items)
                                 {
-                                    // 比對格式範例： "[18:30] [Username]: ..." 
-                                    // 只要包含 "[Username]" 就代表這人在清單中
                                     if (item.ToString().Contains($"[{authorName}]"))
                                     {
                                         foundInLog = true;
@@ -142,53 +141,61 @@ namespace DiscordAutoChat
                                     }
                                 }
 
-                                // 組合顯示文字： [時間] [名字]: 內容
                                 string displayLine = $"[{currentTime}] [{authorName}]: {content}";
 
                                 if (!foundInLog)
                                 {
                                     isNewArrival = true;
-                                    // 發現新 ID，加入列表
                                     lstMessages.Items.Add(displayLine);
 
-                                    // 同步更新左側清單與字典
+                                    // 更新左側列表與字典
                                     if (!lstDMs.Items.Contains(authorName)) lstDMs.Items.Add(authorName);
                                     if (!_userChannels.ContainsKey(authorName)) _userChannels[authorName] = channelId;
                                 }
                                 else
                                 {
-                                    // 已存在的 ID，直接增加對話行，不觸發警報
+                                    // 已存在的 ID，僅增加行
                                     lstMessages.Items.Add(displayLine);
                                 }
 
-                                // 如果目前正選中此人，同步更新右側歷史框
+                                // 自動捲動到底部
+                                lstMessages.TopIndex = lstMessages.Items.Count - 1;
+
+                                // 如果正在查看此對話，更新歷史框
                                 if (_selectedChannelId == channelId)
                                 {
                                     txtChatHistory.AppendText($"{displayLine}\r\n");
                                 }
                             });
 
-                            // --- 2. 如果是「新出現的 ID」，執行轉發提醒 ---
+                            // --- 第二步：針對新 ID 的自動處理 ---
                             if (isNewArrival)
                             {
+                                // A. 如果是陌生私訊，執行「接受請求」
+                                if (isPrivate)
+                                {
+                                    await AcceptMessageRequest(channelId, currentToken);
+                                    await Task.Delay(500); // 緩衝
+                                }
+
+                                // B. 發送「新 ID 提醒」到轉發頻道
                                 string forwardId = txtForwardChannelId.Text.Trim();
                                 if (!string.IsNullOrEmpty(forwardId))
                                 {
-                                    // 執行安全延遲與轉發
-                                    await Task.Delay(random.Next(1000, 2000));
-
-                                    string alertMsg = $"【🔔 新未回覆提醒】";
+                                    // 延遲隨機時間避開系統偵測
+                                    await Task.Delay(random.Next(2000, 4000));
+                                    string alertMsg = $"【🔔 偵測到新未回覆 ID】";
                                     await SendDiscordMessage(forwardId, currentToken, alertMsg);
-
-                                    AppendLog($"[警報] 已將新 ID [{authorName}] 轉發至提醒頻道。");
                                 }
                             }
+
+                            // --- 第三步：自動標記已讀 ---
+                            await MarkAsRead(channelId, messageId, currentToken);
                         }
                     }
                 }
                 catch (Exception ex)
                 {
-                    // 避免因為單個封包解析失敗導致整個 Loop 停止
                     if (_ws.State == WebSocketState.Open)
                         AppendLog($"[監聽錯誤]: {ex.Message}");
                 }
@@ -576,6 +583,33 @@ namespace DiscordAutoChat
                     }
                 }
                 catch { /* 忽略失敗 */ }
+            }
+        }
+
+        // 新增：自動接受陌生私訊的方法
+        private async Task AcceptMessageRequest(string channelId, string token)
+        {
+            try
+            {
+                // Discord API: 接受訊息請求的端點
+                string url = $"https://discord.com/api/v9/channels/{channelId}/recipients/consent";
+
+                using (var request = new HttpRequestMessage(HttpMethod.Post, url))
+                {
+                    request.Headers.TryAddWithoutValidation("Authorization", token);
+                    // 負載通常為空
+                    request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+
+                    var response = await client.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        AppendLog($"[系統] 已自動接受來自頻道 {channelId} 的陌生人訊息。");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[錯誤] 無法接受陌生請求: {ex.Message}");
             }
         }
         private void Form1_Load(object sender, EventArgs e)

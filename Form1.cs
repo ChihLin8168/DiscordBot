@@ -28,6 +28,11 @@ namespace DiscordAutoChat
         // 記錄標記歷史：Key = "AuthorID_Tag", Value = 觸發時間
         private Dictionary<string, DateTime> _lastMentionTimes = new Dictionary<string, DateTime>();
         private readonly TimeSpan _mentionCooldown = TimeSpan.FromMinutes(5);
+        private System.Windows.Forms.Timer _wsCheckTimer;
+        private int _currentTokenIndex = 0;
+        private int _failureCount = 0;       // 目前連續失敗次數
+        private const int _maxFailures = 3;  // 最大容許失敗次數 (超過就停止檢查)
+        private int? _lastSequence = null;
         public Form1()
         {
             InitializeComponent();
@@ -105,87 +110,104 @@ namespace DiscordAutoChat
         // --- WebSocket 監聽登入 ---
         private async void btnConnectWS_Click(object sender, EventArgs e)
         {
-            string token = txtTokens.Lines.FirstOrDefault()?.Trim();
-            if (string.IsNullOrEmpty(token)) { MessageBox.Show("請輸入 Token！"); return; }
+            _failureCount = 0;
+            btnConnectWS.Enabled = false;
 
-            _ws = new ClientWebSocket();
-            try
+            // 呼叫連線邏輯
+            bool success = await StartWSService(true);
+
+            if (success)
             {
-                AppendLog("連接中...");
-                await _ws.ConnectAsync(new Uri("wss://gateway.discord.gg/?v=9&encoding=json"), CancellationToken.None);
-
-                var auth = new
-                {
-                    op = 2,
-                    d = new
-                    {
-                        token = token,
-                        properties = new
-                        {
-                            os = "Windows",
-                            browser = "Chrome", // 偽裝成 Chrome
-                            device = "",
-                            system_locale = "zh-TW",
-                            browser_user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                            browser_version = "120.0.0.0"
-                        },
-                        intents = 32767
-                    }
-                };
-                await SendJsonAsync(JsonConvert.SerializeObject(auth));
-
-                _ = Task.Run(() => ReceiveLoop(token));
-                _ = Task.Run(() => HeartbeatLoop());
-
+                // 連線成功：讓中斷按鈕可以點擊
+                btnDisconnectWS.Enabled = true;
                 btnConnectWS.Enabled = false;
-                lblStatus.Text = "狀態：已連線監聽";
-                lblStatus.ForeColor = System.Drawing.Color.Green;
-                AppendLog("私訊監聽啟動成功。");
             }
-            catch (Exception ex) { AppendLog($"連線失敗: {ex.Message}"); }
+            else
+            {
+                // 登入失敗：恢復連線按鈕，關閉中斷按鈕
+                btnConnectWS.Enabled = true;
+                btnDisconnectWS.Enabled = false;
+            }
         }
         private DateTime _lastForwardTime = DateTime.MinValue;
-        private async Task ReceiveLoop(string currentToken)
+         
+        private async Task ReceiveLoop(string currentToken, CancellationToken ct)
         {
             var buffer = new byte[1024 * 16]; // 16KB 緩衝區
-            while (_ws.State == WebSocketState.Open)
+            AppendLog("[系統] 開始監聽 Discord 事件...");
+
+            while (_ws != null && _ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
             {
                 try
                 {
                     WebSocketReceiveResult result;
-                    var ms = new System.IO.MemoryStream();
+                    string rawJson = "";
 
-                    // 1. 確保完整接收大封包 (如 READY)
-                    do
+                    // 1. 確保完整接收大封包 (如 READY 可能超過 1MB)
+                    using (var ms = new System.IO.MemoryStream())
                     {
-                        result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
-                        ms.Write(buffer, 0, result.Count);
-                    } while (!result.EndOfMessage);
+                        do
+                        {
+                            result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
 
-                    string rawJson = Encoding.UTF8.GetString(ms.ToArray());
+                            if (result.MessageType == WebSocketMessageType.Close)
+                            {
+                                AppendLog("[警告] Discord 伺服器已主動關閉 WebSocket 連線。");
+                                goto ExitLoop;
+                            }
+
+                            ms.Write(buffer, 0, result.Count);
+                        } while (!result.EndOfMessage);
+
+                        rawJson = Encoding.UTF8.GetString(ms.ToArray());
+                    }
+
+                    if (string.IsNullOrWhiteSpace(rawJson)) continue;
+
+                    // 2. 解析 JSON 封包
                     var data = JObject.Parse(rawJson);
+
+                    // 更新序列號 (s)，這對維持連線與心跳至關重要
+                    if (data["s"] != null && data["s"].Type != JTokenType.Null)
+                    {
+                        _lastSequence = data["s"].Value<int>();
+                    }
+
+                    string op = data["op"]?.ToString();
                     string t = data["t"]?.ToString();
 
-                    // 2. 登入成功事件 (獲取自己的 ID)
+                    // --- A. 處理 HELLO (OP 10) ---
+                    if (op == "10")
+                    {
+                        var d = data["d"];
+                        if (d != null && d["heartbeat_interval"] != null)
+                        {
+                            int heartbeatInterval = d["heartbeat_interval"].Value<int>();
+                            // 啟動一個背景任務定時發送心跳
+                            _ = Task.Run(() => StartHeartbeat(heartbeatInterval, _cts.Token));
+                            AppendLog($"[系統] 收到 HELLO，心跳機制已啟動 ({heartbeatInterval}ms)");
+                        }
+                    }
+
+                    // --- B. 登入成功事件 (READY) ---
                     if (!string.IsNullOrEmpty(t) && t.Equals("READY", StringComparison.OrdinalIgnoreCase))
                     {
                         _myUserId = data["d"]["user"]["id"].ToString();
                         AppendLog($"[系統] 登入成功！您的 ID 是: {_myUserId}");
+                        this.Invoke((MethodInvoker)(() => lblStatus.Text = "狀態：已登入"));
                     }
 
-                    // 3. 接收訊息事件 (MESSAGE_CREATE)
+                    // --- C. 接收訊息事件 (MESSAGE_CREATE) ---
                     if (!string.IsNullOrEmpty(t) && t.Equals("MESSAGE_CREATE", StringComparison.OrdinalIgnoreCase))
                     {
                         var d = data["d"];
-                        string authorId = d["author"]["id"].ToString();
-                        string authorName = d["author"]["username"].ToString();
-                        string content = d["content"].ToString();
-                        string channelId = d["channel_id"].ToString();
-                        string messageId = d["id"].ToString();
-                        bool isPrivate = (d["guild_id"] == null); // 是否為私訊
+                        string authorId = d["author"]?["id"]?.ToString();
+                        string authorName = d["author"]?["username"]?.ToString();
+                        string content = d["content"]?.ToString();
+                        string channelId = d["channel_id"]?.ToString();
 
-                        // 排除自己發送的訊息
-                        if (authorId != _myUserId)
+                        // 排除自己發送的訊息且確保欄位不為空
+                        if (authorId != null && authorId != _myUserId)
                         {
                             bool isNewArrival = false;
                             string currentTime = DateTime.Now.ToString("HH:mm");
@@ -194,7 +216,7 @@ namespace DiscordAutoChat
                             this.Invoke((MethodInvoker)delegate
                             {
                                 bool foundInLog = false;
-                                // 檢查中間對話框 lstMessages 是否已有此人名字
+                                // 檢查中間對話框 lstMessages 是否已有此人名字 (保留原本邏輯)
                                 foreach (var item in lstMessages.Items)
                                 {
                                     if (item.ToString().Contains($"[{authorName}]"))
@@ -210,20 +232,16 @@ namespace DiscordAutoChat
                                 {
                                     isNewArrival = true;
                                     lstMessages.Items.Add(displayLine);
-
-                                    // 更新左側列表與字典 
+                                    // 更新左側列表與字典 
                                     if (!_userChannels.ContainsKey(authorName)) _userChannels[authorName] = channelId;
                                 }
                                 else
                                 {
-                                    // 已存在的 ID，僅增加行
                                     lstMessages.Items.Add(displayLine);
                                 }
 
                                 // 自動捲動到底部
                                 lstMessages.TopIndex = lstMessages.Items.Count - 1;
-
-
                             });
 
                             // --- 第二步：標記與轉發邏輯處理 (含 5 分鐘冷卻機制) ---
@@ -255,7 +273,6 @@ namespace DiscordAutoChat
                                     if (content.Contains(rule.Key, StringComparison.OrdinalIgnoreCase))
                                     {
                                         string tagKey = $"{authorId}_{rule.Value}";
-                                        // 檢查該使用者針對此標記是否過期
                                         if (!_lastMentionTimes.ContainsKey(tagKey) || (now - _lastMentionTimes[tagKey]) > _mentionCooldown)
                                         {
                                             matchedIds.Add(rule.Value);
@@ -275,25 +292,36 @@ namespace DiscordAutoChat
                                 {
                                     string mentionString = string.Join(" ", tagsToSend.Distinct());
                                     await ForwardToAdminChannel(currentAdminChannel, currentBotToken, authorName, content, mentionString);
-
                                     AppendLog($"[轉發] 已標記 {mentionString}。 (下次標記此人需等 5 分鐘)");
                                 }
                                 else if (shouldForward == false && isNewArrival)
                                 {
-                                    // 雖然是新 ID，但如果在冷卻中，我們可以選擇只顯示在 UI 不轉發
                                     AppendLog($"[忽略] {authorName} 頻繁觸發，5 分鐘內不重複轉發標記。");
                                 }
                             }
-
                         }
                     }
                 }
+                catch (OperationCanceledException) { break; }
                 catch (Exception ex)
                 {
-                    if (_ws.State == WebSocketState.Open)
-                        AppendLog($"[監聽錯誤]: {ex.Message}");
+                    // 收到異常時記錄但不立刻斷開連線，除非連線狀態真的壞了
+                    if (_ws != null && _ws.State == WebSocketState.Open)
+                    {
+                        AppendLog($"[監聽異常]: {ex.Message}");
+                        await Task.Delay(1000, ct); // 緩衝一下避免無限報錯
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
             }
+
+        ExitLoop:
+            // --- 退出迴圈後的清理 ---
+            StopInternal();
+            this.Invoke((MethodInvoker)(() => lblStatus.Text = "狀態：已斷線"));
         }
 
         // --- 批量發文任務 ---
@@ -320,6 +348,14 @@ namespace DiscordAutoChat
 
         private async Task RunChatTask(List<string> channels, List<string> tokens, string msg, CancellationToken ct)
         {
+
+            // 只有當 WebSocket 物件存在，且狀態為 Open (已連線) 時，才繼續執行
+            if (_ws == null || _ws.State != WebSocketState.Open)
+            {
+                // 選擇性記錄：如果你想知道為什麼沒轉發，可以取消註解下一行
+                AppendLog("[系統] 連線已中斷，停止發送訊息。");
+                return;
+            }
             try
             {
                 AppendLog("[系統] 自動發文任務已啟動。");
@@ -350,7 +386,7 @@ namespace DiscordAutoChat
                             if (ct.IsCancellationRequested) break;
 
                             await SendDiscordMessage(channelId, auth, msg);
-                            AppendLog($"[發送] 頻道: {channelId} 成功。");
+                            AppendLog($"[發送推文] 頻道: {channelId} 成功。");
 
                             // 隨機延遲，傳入 ct 確保按下停止時能「立刻」中斷，而不是等完這幾秒
                             int nextDelay = random.Next(2000, 5000);
@@ -402,22 +438,6 @@ namespace DiscordAutoChat
             }
         }
 
-        private async Task HeartbeatLoop()
-        {
-            while (_ws.State == WebSocketState.Open)
-            {
-                await Task.Delay(40000);
-                await SendJsonAsync(JsonConvert.SerializeObject(new { op = 1, d = (int?)null }));
-            }
-        }
-
-        private async Task SendJsonAsync(string json)
-        {
-            var bytes = Encoding.UTF8.GetBytes(json);
-            if (_ws.State == WebSocketState.Open)
-                await _ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-
         private void btnStop_Click(object sender, EventArgs e)
         {
             if (_cts != null)
@@ -427,10 +447,6 @@ namespace DiscordAutoChat
                 // 這裡不需要 Dispose，讓 Task 內部的 finally 處理 UI 狀態
             }
         }
-
-
-
-
 
         private void btnClearLogs_Click(object sender, EventArgs e)
         {
@@ -507,16 +523,16 @@ namespace DiscordAutoChat
                     {
                         content = $"{mentionTag} 📩 **收到新私訊**",
                         embeds = new[] {
-                    new {
-                        title = "訊息詳情",
-                        color = 3447003,
-                        fields = new[] {
-                            new { name = "發送者", value = senderName, inline = true },
-                            new { name = "內容", value = messageContent, inline = false }
-                        },
-                        footer = new { text = "自動監控系統" }
-                    }
-                }
+                            new {
+                                title = "訊息詳情",
+                                color = 3447003,
+                                fields = new[] {
+                                    new { name = "發送者", value = senderName, inline = true },
+                                    new { name = "內容", value = messageContent, inline = false }
+                                },
+                                footer = new { text = "自動監控系統" }
+                            }
+                        }
                     };
 
                     request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
@@ -535,6 +551,14 @@ namespace DiscordAutoChat
         }
         public async Task ForwardToAdminChannel(string channelId, string botToken, string senderName, string messageContent, string mentionTag)
         {
+
+            // 只有當 WebSocket 物件存在，且狀態為 Open (已連線) 時，才繼續執行
+            if (_ws == null || _ws.State != WebSocketState.Open)
+            {
+                // 選擇性記錄：如果你想知道為什麼沒轉發，可以取消註解下一行
+                // AppendLog("[轉發跳過] 監聽連線已中斷，停止發送轉發訊息。");
+                return;
+            }
             string url = $"https://discord.com/api/v10/channels/{channelId}/messages";
 
             try
@@ -550,7 +574,6 @@ namespace DiscordAutoChat
                         content = $"{(string.IsNullOrEmpty(mentionTag) ? "" : mentionTag + " ")}🔔 **【新私訊轉發】**",
                         embeds = new[] {
                                 new {
-                                    title = "詳細訊息內容",
                                     color = 3447003, // 藍色
                                     fields = new[] {
                                         new { name = "發送者", value = senderName, inline = true },
@@ -648,6 +671,192 @@ namespace DiscordAutoChat
             var keysToRemove = _lastMentionTimes.Where(kv => (now - kv.Value) > _mentionCooldown)
                                               .Select(kv => kv.Key).ToList();
             foreach (var key in keysToRemove) _lastMentionTimes.Remove(key);
+        }
+
+        // 在 Form1_Load 或 btnConnectWS_Click 成功後初始化
+        private void InitWsMonitor()
+        {
+            if (_wsCheckTimer == null)
+            {
+                _wsCheckTimer = new System.Windows.Forms.Timer();
+                _wsCheckTimer.Interval = 5 * 60 * 1000; // 5 分鐘 (毫秒)
+                _wsCheckTimer.Tick += WsCheckTimer_Tick;
+            }
+            _wsCheckTimer.Start();
+            AppendLog("[系統] 已啟動連線自動監控 (每 5 分鐘檢查一次)");
+        }
+
+        private async void WsCheckTimer_Tick(object sender, EventArgs e)
+        {
+            // 如果連線狀態不正常，且失敗次數還在容許範圍內
+            if (_ws == null || _ws.State != WebSocketState.Open)
+            {
+                if (_failureCount < _maxFailures)
+                {
+                    await StartWSService(false); // 這是自動重連，不是初始登入
+                }
+                else
+                {
+                    _wsCheckTimer.Stop();
+                    AppendLog("[監控停止] 連續重連失敗，已停止自動檢查。");
+                }
+            }
+            else
+            {
+                // 連線正常，更新狀態標籤 (選配)
+                lblStatus.Text = $"狀態：連線中 ({DateTime.Now:HH:mm:ss} 檢查正常)";
+            }
+        }
+
+        public async Task<bool> StartWSService(bool isManualClick = false)
+        {
+            // 1. 取得 Token
+            string[] tokenList = txtTokens.Lines.Where(t => !string.IsNullOrWhiteSpace(t)).ToArray();
+            if (tokenList.Length == 0) return false;
+            string currentToken = tokenList[0].Trim();
+
+            // 2. 清理舊資源
+            StopInternal();
+
+            _ws = new ClientWebSocket();
+            _cts = new CancellationTokenSource();
+            // 使用 v10 版本，並確保編碼為 json
+            Uri uri = new Uri("wss://gateway.discord.gg/?v=10&encoding=json");
+
+            try
+            {
+                AppendLog("[連線] 正在連接 Discord ...");
+
+                // 設定連線逾時
+                var connectTask = _ws.ConnectAsync(uri, _cts.Token);
+                if (await Task.WhenAny(connectTask, Task.Delay(8000)) != connectTask) throw new Exception("網路連線逾時");
+
+                // 3. 準備 Identity (修正格式以符合個人 Token)
+                // 注意：這裡使用了 Dictionary 確保產出的 JSON Key 包含 $ 符號，且移除了 intents
+                var identity = new
+                {
+                    op = 2,
+                    d = new
+                    {
+                        token = currentToken,
+                        properties = new Dictionary<string, string> {
+                    { "$os", "windows" },
+                    { "$browser", "chrome" },
+                    { "$device", "pc" }
+                }
+                        // 個人 Token 不要加 intents = 32767，否則會被秒踢
+                    }
+                };
+
+                string json = JsonConvert.SerializeObject(identity);
+                await _ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)), WebSocketMessageType.Text, true, _cts.Token);
+
+                // 4. 重要：等待驗證結果
+                // Discord 在收到 Identity 後，如果 Token 錯誤會立刻斷開連線
+                await Task.Delay(2000);
+
+                if (_ws.State != WebSocketState.Open)
+                {
+                    // 如果走到這裡 State 變成了 Aborted 或 Closed，代表驗證失敗
+                    throw new Exception("Token 驗證失敗 (Discord 已主動拒絕連線)");
+                }
+
+                // --- 確定成功連線後，才啟動後續機制 ---
+                AppendLog("[成功] 驗證通過，啟動監聽。");
+                lblStatus.Invoke((MethodInvoker)(() => lblStatus.Text = "狀態：連線中"));
+
+                _failureCount = 0;
+
+                // 5. 正式開啟接收迴圈
+                _ = Task.Run(() => ReceiveLoop(currentToken, _cts.Token));
+
+                // 6. 啟動 5 分鐘自動巡檢
+                InitWsMonitor();
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                // 核心邏輯：只要 catch 到任何錯誤，就徹底關閉，不進監聽
+                AppendLog($"[登入失敗]: {ex.Message}");
+                lblStatus.Invoke((MethodInvoker)(() => lblStatus.Text = "狀態：登入錯誤"));
+
+                if (_wsCheckTimer != null) _wsCheckTimer.Stop();
+                StopInternal();
+
+                AppendLog("[停止] 初始登入失敗，已取消自動監聽機制。");
+                return false;
+            }
+        }
+
+        // 輔助方法：統一清理連線資源
+        private void StopInternal()
+        {
+            if (_cts != null) { _cts.Cancel(); _cts.Dispose(); _cts = null; }
+            if (_ws != null) { _ws.Dispose(); _ws = null; }
+        }
+        // 心跳發送方法
+        private async Task StartHeartbeat(int interval, CancellationToken ct)
+        {
+          
+            AppendLog($"[系統] 系統會持續檢查連線。");
+
+            while (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(interval, ct);
+
+                // 這裡最容易噴 NullReferenceException！
+                if (_ws == null || _ws.State != WebSocketState.Open) break;
+
+                try
+                {
+                    var heartbeat = new { op = 1, d = _lastSequence }; // 確保 _lastSequence 有初始化
+                    string json = JsonConvert.SerializeObject(heartbeat);
+                    await _ws.SendAsync(new ArraySegment<byte>(Encoding.UTF8.GetBytes(json)),
+                                       WebSocketMessageType.Text, true, ct);
+                }
+                catch { break; }
+                finally
+                {
+                    AppendLog("[系統] 檢查Token連線正常。");
+                }
+            }
+           
+        }
+
+        private async void btnDisconnectWS_Click(object sender, EventArgs e)
+        {
+            btnDisconnectWS.Enabled = false;
+            _failureCount = 0;
+
+            AppendLog("[系統] 使用者點擊中斷連線...");
+
+            // 1. 停止計時器與清理資源
+            if (_wsCheckTimer != null) _wsCheckTimer.Stop();
+            StopInternal();
+
+            lblStatus.Text = "狀態：已手動斷開";
+
+            // 2. 恢復連線按鈕狀態
+            btnConnectWS.Enabled = true;
+            AppendLog("[系統] 監聽已停止。");
+        }
+
+        private void button1_Click(object sender, EventArgs e)
+        {
+            if (button1.Text == "修改")
+            {
+                txtTargetChannelId.Enabled = true;
+                txtBotToken.Enabled = true;
+                button1.Text = "完成";
+            }
+            else
+            {
+                txtTargetChannelId.Enabled = false;
+                txtBotToken.Enabled = false;
+                button1.Text = "修改";
+            }
+
         }
     }
 }
